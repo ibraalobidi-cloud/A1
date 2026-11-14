@@ -46,6 +46,7 @@ const audioCache = new Map<string, string>(); // key: `${tone}::${text}` -> blob
 let activeAbortController: AbortController | null = null;
 let sharedAudio: HTMLAudioElement | null = null;
 let audioUnlocked = false;
+let usingBrowserFallback = false;
 let lastRequest: { text: string; id: string; tone: VoiceTone; title: string } | null = null;
 
 function getAudioElement(): HTMLAudioElement | null {
@@ -60,19 +61,19 @@ function getAudioElement(): HTMLAudioElement | null {
     });
 
     sharedAudio.addEventListener('pause', () => {
-      if (sharedAudio && !sharedAudio.ended && state.status === 'playing') {
+      if (sharedAudio && !sharedAudio.ended && state.status === 'playing' && !usingBrowserFallback) {
         updateState({ status: 'paused' });
       }
     });
 
     sharedAudio.addEventListener('play', () => {
-      if (state.activeId) {
+      if (state.activeId && !usingBrowserFallback) {
         updateState({ status: 'playing', errorMessage: null });
       }
     });
 
     sharedAudio.addEventListener('error', () => {
-      if (state.activeId) {
+      if (state.activeId && !usingBrowserFallback) {
         updateState({
           status: 'error',
           errorMessage: 'تعذر تشغيل المقطع الصوتي على هذا الجهاز.'
@@ -123,6 +124,72 @@ export function subscribeSpeechState(listener: SpeechListener): () => void {
   };
 }
 
+function stopBrowserFallback() {
+  usingBrowserFallback = false;
+  if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+    window.speechSynthesis.cancel();
+  }
+}
+
+function speakWithBrowserFallback(text: string, id: string, title: string): boolean {
+  if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+    return false;
+  }
+
+  try {
+    stopBrowserFallback();
+    usingBrowserFallback = true;
+    const utterance = new SpeechSynthesisUtterance(text);
+    const voices = window.speechSynthesis.getVoices();
+    const arabicFemaleVoice =
+      voices.find(
+        (v) =>
+          v.lang.toLowerCase().startsWith('ar') &&
+          /zariyah|salma|laila|amira|mariam|female|woman/i.test(v.name)
+      ) ||
+      voices.find((v) => v.lang.toLowerCase().startsWith('ar-sa')) ||
+      voices.find((v) => v.lang.toLowerCase().startsWith('ar')) ||
+      null;
+
+    if (arabicFemaleVoice) {
+      utterance.voice = arabicFemaleVoice;
+    }
+    utterance.lang = 'ar-SA';
+    utterance.rate = 0.96;
+    utterance.volume = state.muted ? 0 : state.volume;
+
+    updateState({
+      activeId: id,
+      title,
+      status: 'playing',
+      errorMessage: null
+    });
+
+    utterance.onend = () => {
+      usingBrowserFallback = false;
+      if (state.activeId === id) {
+        updateState({ status: 'idle', activeId: null, errorMessage: null });
+      }
+    };
+
+    utterance.onerror = () => {
+      usingBrowserFallback = false;
+      if (state.activeId === id) {
+        updateState({
+          status: 'error',
+          errorMessage: 'تعذر تشغيل الصوت. تأكد من إضافة GEMINI_API_KEY في إعدادات النشر.'
+        });
+      }
+    };
+
+    window.speechSynthesis.speak(utterance);
+    return true;
+  } catch {
+    usingBrowserFallback = false;
+    return false;
+  }
+}
+
 export function stopArabicSpeech() {
   if (activeAbortController) {
     activeAbortController.abort();
@@ -132,6 +199,7 @@ export function stopArabicSpeech() {
     sharedAudio.pause();
     sharedAudio.currentTime = 0;
   }
+  stopBrowserFallback();
   updateState({
     activeId: null,
     status: 'idle',
@@ -140,6 +208,17 @@ export function stopArabicSpeech() {
 }
 
 export function togglePauseVoiceover() {
+  if (usingBrowserFallback && typeof window !== 'undefined' && 'speechSynthesis' in window) {
+    if (state.status === 'playing') {
+      window.speechSynthesis.pause();
+      updateState({ status: 'paused' });
+    } else if (state.status === 'paused') {
+      window.speechSynthesis.resume();
+      updateState({ status: 'playing' });
+    }
+    return;
+  }
+
   const audio = getAudioElement();
   if (!audio || !state.activeId) return;
   if (state.status === 'playing') {
@@ -207,21 +286,29 @@ export async function speakArabic(text: string, id: string, options: SpeakOption
   }
 
   // If currently paused on this exact clip, resume smoothly
-  if (!forceReplay && state.activeId === id && state.status === 'paused' && sharedAudio) {
-    try {
-      await sharedAudio.play();
+  if (!forceReplay && state.activeId === id && state.status === 'paused') {
+    if (usingBrowserFallback && 'speechSynthesis' in window) {
+      window.speechSynthesis.resume();
       updateState({ status: 'playing', errorMessage: null });
       return;
-    } catch {
-      // Fall through to fresh playback
+    }
+    if (sharedAudio) {
+      try {
+        await sharedAudio.play();
+        updateState({ status: 'playing', errorMessage: null });
+        return;
+      } catch {
+        // Fall through to fresh playback
+      }
     }
   }
 
-  // Prevent overlapping clips: abort any in-flight request and pause previous audio
+  // Prevent overlapping clips: abort any in-flight request and stop previous audio
   if (activeAbortController) {
     activeAbortController.abort();
     activeAbortController = null;
   }
+  stopBrowserFallback();
   const audio = getAudioElement();
   if (audio) {
     audio.pause();
@@ -271,13 +358,17 @@ export async function speakArabic(text: string, id: string, options: SpeakOption
       signal: controller.signal
     });
 
-    if (!response.ok) {
-      let errMsg = 'تعذر توليد الصوت حالياً.';
-      try {
-        const errData = (await response.json()) as { error?: string };
-        if (errData?.error) errMsg = errData.error;
-      } catch {
-        // Ignore parse error
+    const contentType = response.headers.get('content-type') || '';
+
+    if (!response.ok || !contentType.includes('audio/')) {
+      let errMsg = 'تعذر توليد الصوت من الخادم.';
+      if (contentType.includes('application/json')) {
+        try {
+          const errData = (await response.json()) as { error?: string };
+          if (errData?.error) errMsg = errData.error;
+        } catch {
+          // Ignore JSON parse error
+        }
       }
       throw new Error(errMsg);
     }
@@ -302,11 +393,16 @@ export async function speakArabic(text: string, id: string, options: SpeakOption
     if (err instanceof DOMException && err.name === 'AbortError') {
       return;
     }
-    const message = err instanceof Error ? err.message : 'حدث خطأ أثناء تشغيل التعليق الصوتي.';
-    updateState({
-      status: 'error',
-      errorMessage: message
-    });
+
+    // Emergency fallback to device Arabic voice if serverless endpoint / key isn't configured yet
+    const fallbackStarted = speakWithBrowserFallback(text, id, title);
+    if (!fallbackStarted) {
+      const message = err instanceof Error ? err.message : 'حدث خطأ أثناء تشغيل التعليق الصوتي.';
+      updateState({
+        status: 'error',
+        errorMessage: message
+      });
+    }
   } finally {
     if (activeAbortController === controller) {
       activeAbortController = null;
